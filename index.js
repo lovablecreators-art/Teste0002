@@ -15,43 +15,68 @@ app.post('/api/servers', async (req, res) => {
     const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'Token não fornecido.' });
 
-    // Remove aspas e espaços acidentais
     const cleanToken = token.trim().replace(/^["']|["']$/g, '');
 
-    try {
-        // 1. Busca os servidores do usuário com os cabeçalhos corretos
-        const guildsRes = await fetch('https://discord.com/api/v9/users/@me/guilds', {
-            headers: {
-                'Authorization': cleanToken,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-        });
-
-        if (!guildsRes.ok) {
-            return res.status(401).json({ error: 'Token recusado pelo Discord (Status: ' + guildsRes.status + ').' });
+    // Se a sessão já existe e está pronta, retorna imediatamente
+    if (sessions.has(cleanToken)) {
+        const activeClient = sessions.get(cleanToken).client;
+        if (activeClient && activeClient.readyTimestamp) {
+            return sendGuildsData(activeClient, res);
         }
+    }
 
-        const userGuilds = await guildsRes.json();
+    const client = new Client({
+        checkUpdate: false,
+        syncStatus: false,
+        ws: { properties: { os: 'Windows', browser: 'Discord Client' } }
+    });
 
-        // 2. Conecta a sessão em segundo plano se ainda não existir
-        if (!sessions.has(cleanToken)) {
-            const client = new Client({ checkUpdate: false, syncStatus: false });
-            client.login(cleanToken).catch(() => {});
+    let handled = false;
+
+    const timeout = setTimeout(() => {
+        if (!handled) {
+            handled = true;
+            client.destroy();
+            return res.status(429).json({ error: 'O Discord bloqueou temporariamente por excesso de tentativas (Rate Limit). Aguarde 2 minutos e tente novamente.' });
+        }
+    }, 20000);
+
+    client.once('ready', () => {
+        if (!handled) {
+            handled = true;
+            clearTimeout(timeout);
             sessions.set(cleanToken, { client });
+            sendGuildsData(client, res);
         }
+    });
 
-        // 3. Formata e envia a lista de servidores
-        const guilds = userGuilds.map(g => ({
-            id: g.id,
-            name: g.name,
-            channels: []
+    try {
+        await client.login(cleanToken);
+    } catch (err) {
+        if (!handled) {
+            handled = true;
+            clearTimeout(timeout);
+            client.destroy();
+            return res.status(401).json({ error: 'Falha na autenticação: ' + err.message });
+        }
+    }
+});
+
+function sendGuildsData(client, res) {
+    try {
+        const guilds = client.guilds.cache.map(guild => ({
+            id: guild.id,
+            name: guild.name,
+            channels: guild.channels.cache
+                .filter(c => c.type === 'GUILD_VOICE' || c.type === 2)
+                .map(c => ({ id: c.id, name: c.name }))
         }));
 
         return res.json({ guilds });
     } catch (err) {
-        return res.status(500).json({ error: 'Erro de conexão: ' + err.message });
+        return res.status(500).json({ error: 'Erro ao listar servidores e canais.' });
     }
-});
+}
 
 app.post('/api/connect', async (req, res) => {
     const { token, guildId, channelId } = req.body;
@@ -63,7 +88,9 @@ app.post('/api/connect', async (req, res) => {
     }
 
     try {
-        const guild = await session.client.guilds.fetch(guildId);
+        const guild = session.client.guilds.cache.get(guildId);
+        if (!guild) return res.status(404).json({ error: 'Servidor não encontrado.' });
+
         const connection = joinVoiceChannel({
             channelId,
             guildId,
@@ -75,7 +102,7 @@ app.post('/api/connect', async (req, res) => {
         session.connection = connection;
         return res.json({ success: true, message: 'Conectado à call com sucesso!' });
     } catch (err) {
-        return res.status(500).json({ error: 'Erro ao entrar no canal de voz: ' + err.message });
+        return res.status(500).json({ error: 'Erro ao entrar na call: ' + err.message });
     }
 });
 
@@ -88,7 +115,7 @@ app.post('/api/disconnect', (req, res) => {
         if (session.connection) session.connection.destroy();
         if (session.client) session.client.destroy();
         sessions.delete(cleanToken);
-        return res.json({ success: true });
+        return res.json({ success: true, message: 'Desconectado com sucesso.' });
     }
 
     return res.status(400).json({ error: 'Nenhuma conexão ativa.' });
@@ -96,4 +123,4 @@ app.post('/api/disconnect', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
-            
+        
