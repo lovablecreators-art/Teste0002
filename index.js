@@ -7,89 +7,109 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
+// Armazena as sessões ativas dos usuários por token
 const sessions = new Map();
 
-app.get('/', (req, res) => res.send('Backend rodando com sucesso!'));
+// Rota de Healthcheck do Render
+app.get('/', (req, res) => {
+    res.status(200).send('Backend rodando com sucesso!');
+});
 
+// Helper para padronizar o cabeçalho do Discord simulando navegador
+function getDiscordHeaders(token) {
+    const cleanToken = token.trim().replace(/^["']|["']$/g, '');
+    return {
+        'Authorization': cleanToken,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7'
+    };
+}
+
+// 1. CARREGAR SERVIDORES E CANAIS DE VOZ
 app.post('/api/servers', async (req, res) => {
     const { token } = req.body;
-    if (!token) return res.status(400).json({ error: 'Token não fornecido.' });
-
-    const cleanToken = token.trim().replace(/^["']|["']$/g, '');
-
-    // Se a sessão já existe e está pronta, retorna imediatamente
-    if (sessions.has(cleanToken)) {
-        const activeClient = sessions.get(cleanToken).client;
-        if (activeClient && activeClient.readyTimestamp) {
-            return sendGuildsData(activeClient, res);
-        }
+    if (!token) {
+        return res.status(400).json({ error: 'Token não fornecido.' });
     }
 
-    const client = new Client({
-        checkUpdate: false,
-        syncStatus: false,
-        ws: { properties: { os: 'Windows', browser: 'Discord Client' } }
-    });
-
-    let handled = false;
-
-    const timeout = setTimeout(() => {
-        if (!handled) {
-            handled = true;
-            client.destroy();
-            return res.status(429).json({ error: 'O Discord bloqueou temporariamente por excesso de tentativas (Rate Limit). Aguarde 2 minutos e tente novamente.' });
-        }
-    }, 20000);
-
-    client.once('ready', () => {
-        if (!handled) {
-            handled = true;
-            clearTimeout(timeout);
-            sessions.set(cleanToken, { client });
-            sendGuildsData(client, res);
-        }
-    });
+    const cleanToken = token.trim().replace(/^["']|["']$/g, '');
+    const headers = getDiscordHeaders(cleanToken);
 
     try {
-        await client.login(cleanToken);
-    } catch (err) {
-        if (!handled) {
-            handled = true;
-            clearTimeout(timeout);
-            client.destroy();
-            return res.status(401).json({ error: 'Falha na autenticação: ' + err.message });
+        // Busca a lista de guildas do usuário
+        const guildsRes = await fetch('https://discord.com/api/v9/users/@me/guilds', { headers });
+
+        if (!guildsRes.ok) {
+            if (guildsRes.status === 401) {
+                return res.status(401).json({ error: 'Token do Discord inválido ou expirado.' });
+            }
+            if (guildsRes.status === 429) {
+                const retryAfter = guildsRes.headers.get('Retry-After') || 5;
+                return res.status(429).json({ error: `Bloqueio temporário (Rate Limit). Aguarde ${retryAfter} segundos e tente novamente.` });
+            }
+            return res.status(guildsRes.status).json({ error: `Erro do Discord: Status ${guildsRes.status}` });
         }
+
+        const userGuilds = await guildsRes.json();
+
+        // Para cada servidor, busca os canais de voz
+        const guildsWithChannels = await Promise.all(
+            userGuilds.map(async (guild) => {
+                try {
+                    const channelsRes = await fetch(`https://discord.com/api/v9/guilds/${guild.id}/channels`, { headers });
+                    if (!channelsRes.ok) return { id: guild.id, name: guild.name, channels: [] };
+
+                    const channels = await channelsRes.json();
+                    
+                    // Filtra apenas canais de voz (tipo 2 = GUILD_VOICE, tipo 13 = GUILD_STAGE_VOICE)
+                    const voiceChannels = channels
+                        .filter(c => c.type === 2 || c.type === 13)
+                        .map(c => ({ id: c.id, name: c.name }));
+
+                    return {
+                        id: guild.id,
+                        name: guild.name,
+                        channels: voiceChannels
+                    };
+                } catch {
+                    return { id: guild.id, name: guild.name, channels: [] };
+                }
+            })
+        );
+
+        return res.json({ guilds: guildsWithChannels });
+    } catch (err) {
+        return res.status(500).json({ error: 'Erro interno no backend: ' + err.message });
     }
 });
 
-function sendGuildsData(client, res) {
-    try {
-        const guilds = client.guilds.cache.map(guild => ({
-            id: guild.id,
-            name: guild.name,
-            channels: guild.channels.cache
-                .filter(c => c.type === 'GUILD_VOICE' || c.type === 2)
-                .map(c => ({ id: c.id, name: c.name }))
-        }));
-
-        return res.json({ guilds });
-    } catch (err) {
-        return res.status(500).json({ error: 'Erro ao listar servidores e canais.' });
-    }
-}
-
+// 2. CONECTAR AO CANAL DE VOZ
 app.post('/api/connect', async (req, res) => {
     const { token, guildId, channelId } = req.body;
-    const cleanToken = token ? token.trim().replace(/^["']|["']$/g, '') : '';
-    const session = sessions.get(cleanToken);
-
-    if (!session || !session.client) {
-        return res.status(400).json({ error: 'Sessão não encontrada. Recarregue os servidores.' });
+    if (!token || !guildId || !channelId) {
+        return res.status(400).json({ error: 'Parâmetros ausentes (token, guildId ou channelId).' });
     }
 
+    const cleanToken = token.trim().replace(/^["']|["']$/g, '');
+    let session = sessions.get(cleanToken);
+
     try {
-        const guild = session.client.guilds.cache.get(guildId);
-        if (!guild) return res.status(404).json({ error: 'Servidor não encontrado.' });
+        if (!session || !session.client) {
+            const client = new Client({ checkUpdate: false, syncStatus: false });
+            
+            await client.login(cleanToken);
+            session = { client };
+            sessions.set(cleanToken, session);
+        }
+
+        const guild = await session.client.guilds.fetch(guildId);
+        if (!guild) return res.status(404).json({ error: 'Servidor não encontrado no cliente.' });
+
+        // Desconecta de conexão anterior se existir
+        if (session.connection) {
+            try { session.connection.destroy(); } catch {}
+        }
 
         const connection = joinVoiceChannel({
             channelId,
@@ -100,27 +120,36 @@ app.post('/api/connect', async (req, res) => {
         });
 
         session.connection = connection;
-        return res.json({ success: true, message: 'Conectado à call com sucesso!' });
+        return res.json({ success: true, message: 'Conectado com sucesso ao canal de voz!' });
     } catch (err) {
-        return res.status(500).json({ error: 'Erro ao entrar na call: ' + err.message });
+        return res.status(500).json({ error: 'Erro ao conectar no canal de voz: ' + err.message });
     }
 });
 
+// 3. DESCONECTAR DO CANAL DE VOZ
 app.post('/api/disconnect', (req, res) => {
     const { token } = req.body;
-    const cleanToken = token ? token.trim().replace(/^["']|["']$/g, '') : '';
+    if (!token) return res.status(400).json({ error: 'Token não fornecido.' });
+
+    const cleanToken = token.trim().replace(/^["']|["']$/g, '');
     const session = sessions.get(cleanToken);
 
     if (session) {
-        if (session.connection) session.connection.destroy();
-        if (session.client) session.client.destroy();
+        if (session.connection) {
+            try { session.connection.destroy(); } catch {}
+        }
+        if (session.client) {
+            try { session.client.destroy(); } catch {}
+        }
         sessions.delete(cleanToken);
         return res.json({ success: true, message: 'Desconectado com sucesso.' });
     }
 
-    return res.status(400).json({ error: 'Nenhuma conexão ativa.' });
+    return res.status(400).json({ error: 'Nenhuma sessão ativa encontrada para este token.' });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Backend rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
+});
         
